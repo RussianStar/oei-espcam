@@ -1,9 +1,7 @@
-#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -100,20 +98,20 @@ static void camera_deinit(void) {
     }
 }
 
-static void write_all(const void *buf, size_t len) {
+static void write_all_usb(const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     while (len > 0) {
-        ssize_t w = write(STDOUT_FILENO, p, len);
+        int w = usb_serial_jtag_write_bytes(p, len, pdMS_TO_TICKS(1000));
         if (w > 0) {
             p += (size_t)w;
             len -= (size_t)w;
             continue;
         }
-        if (w < 0 && errno == EAGAIN) {
+        if (w == 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        ESP_LOGW(TAG, "write error: %d", errno);
+        ESP_LOGW(TAG, "usb write error: %d", w);
         return;
     }
 }
@@ -125,7 +123,7 @@ static void write_u32_le(uint32_t v) {
         (uint8_t)(v >> 16),
         (uint8_t)(v >> 24),
     };
-    write_all(b, sizeof(b));
+    write_all_usb(b, sizeof(b));
 }
 
 static void do_snap(void) {
@@ -140,10 +138,10 @@ static void do_snap(void) {
     }
 
     // Frame: MAGIC + LEN + JPEG + END
-    write_all(MAGIC, sizeof(MAGIC));
+    write_all_usb(MAGIC, sizeof(MAGIC));
     write_u32_le((uint32_t)fb->len);
-    write_all(fb->buf, fb->len);
-    write_all(END, sizeof(END));
+    write_all_usb(fb->buf, fb->len);
+    write_all_usb(END, sizeof(END));
 
     esp_camera_fb_return(fb);
 
@@ -159,9 +157,9 @@ static void cmd_task(void *arg) {
     // stdin over USB Serial/JTAG can occasionally return 0 bytes; ignore and retry.
     while (1) {
         uint8_t ch;
-        ssize_t r = read(STDIN_FILENO, &ch, 1);
+        int r = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(20));
 
-        if (r == 1) {
+        if (r > 0) {
             if (ch == '\n' || ch == '\r') {
                 line[n] = 0;
                 if (strcmp(line, "SNAP") == 0) {
@@ -179,12 +177,7 @@ static void cmd_task(void *arg) {
             continue;
         }
 
-        if (errno == EAGAIN) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        ESP_LOGW(TAG, "read error: %d", errno);
+        ESP_LOGW(TAG, "usb read error: %d", r);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
