@@ -8,13 +8,17 @@ MAGIC = b"JPG0"
 END = b"END0"
 
 
-def read_exact(ser, n):
+def read_exact(ser, n, max_idle_s=10.0):
     buf = bytearray()
+    last_progress = time.time()
     while len(buf) < n:
         chunk = ser.read(n - len(buf))
-        if not chunk:
+        if chunk:
+            buf += chunk
+            last_progress = time.time()
+            continue
+        if time.time() - last_progress > max_idle_s:
             raise TimeoutError(f"timeout reading {n} bytes (got {len(buf)})")
-        buf += chunk
     return bytes(buf)
 
 
@@ -68,20 +72,20 @@ def main():
     ser.write(b"SNAP\n")
     ser.flush()
 
-    if not wait_for_token(ser, b"ACK\n", 3.0):
+    if not wait_for_token(ser, b"ACK\n", 5.0):
         raise TimeoutError("timeout waiting for ACK")
 
-    if not sync_magic(ser, 2.0):
+    if not sync_magic(ser, 5.0):
         raise TimeoutError("timeout waiting for JPG0")
 
-    ser.timeout = 5
-    (length,) = struct.unpack("<I", read_exact(ser, 4))
+    ser.timeout = 1
+    (length,) = struct.unpack("<I", read_exact(ser, 4, max_idle_s=5.0))
     if length == 0:
         raise RuntimeError("device reported capture failure (length=0)")
     if length > 10 * 1024 * 1024:
         raise RuntimeError(f"invalid length: {length}")
-    jpg = read_exact(ser, length)
-    tail = read_exact(ser, 4)
+    jpg = read_exact(ser, length, max_idle_s=15.0)
+    tail = read_exact(ser, 4, max_idle_s=5.0)
     if tail != END:
         raise RuntimeError(f"bad tail: {tail!r}")
 

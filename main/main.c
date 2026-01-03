@@ -134,10 +134,13 @@ static void camera_deinit(void) {
     }
 }
 
+#define USB_WRITE_CHUNK 1024
+
 static void write_all_usb(const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     while (len > 0) {
-        int w = usb_serial_jtag_write_bytes(p, len, pdMS_TO_TICKS(1000));
+        size_t to_write = len > USB_WRITE_CHUNK ? USB_WRITE_CHUNK : len;
+        int w = usb_serial_jtag_write_bytes(p, to_write, pdMS_TO_TICKS(2000));
         if (w > 0) {
             p += (size_t)w;
             len -= (size_t)w;
@@ -300,8 +303,8 @@ static void cmd_task(void *arg) {
 void app_main(void) {
     // Install USB Serial/JTAG driver + route stdio via VFS.
     usb_serial_jtag_driver_config_t cfg = {
-        .tx_buffer_size = 4096,
-        .rx_buffer_size = 4096,
+        .tx_buffer_size = 8192,
+        .rx_buffer_size = 8192,
     };
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
     usb_serial_jtag_vfs_use_driver();
