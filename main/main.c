@@ -47,6 +47,10 @@ static const uint8_t END[4] = {'E', 'N', 'D', '0'};
 
 #define CAM_I2C_PORT I2C_NUM_1
 
+#ifndef SNAP_I2C_PROBE
+#define SNAP_I2C_PROBE 0
+#endif
+
 // OV2640 cannot do true 1920x1080; use UXGA (1600x1200) max.
 // If you install OV5640/OV3660, set FRAMESIZE_FHD.
 #ifndef SNAP_FRAME_SIZE
@@ -182,8 +186,14 @@ static void camera_self_test(void) {
 #endif
     ESP_LOGI(TAG, "psram: %s, free=%u bytes", psram_ok ? "ok" : "not detected",
              (unsigned)psram_free);
+    if (!psram_ok) {
+        ESP_LOGW(TAG, "psram not detected; enable SPI RAM in menuconfig for higher resolutions");
+    }
 
-    // Probe camera SCCB/I2C before esp_camera_init to help debug sensor detection.
+#if SNAP_I2C_PROBE
+    // Optional probe for SCCB/I2C sensor presence before esp_camera_init.
+    vTaskDelay(pdMS_TO_TICKS(200));
+    esp_log_level_set("i2c.master", ESP_LOG_NONE);
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = CAM_I2C_PORT,
         .sda_io_num = SIOD_GPIO_NUM,
@@ -206,28 +216,6 @@ static void camera_self_test(void) {
             }
         }
 
-        i2c_device_config_t dev_cfg = {
-            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-            .device_address = 0x30, // OV2640 default
-            .scl_speed_hz = 100000,
-            .scl_wait_us = 0,
-        };
-        i2c_master_dev_handle_t dev = NULL;
-        if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) == ESP_OK) {
-            uint8_t val = 0;
-            uint8_t reg = 0x0A;
-            if (i2c_master_transmit_receive(dev, &reg, 1, &val, 1,
-                                            pdMS_TO_TICKS(100)) == ESP_OK) {
-                ESP_LOGI(TAG, "i2c: addr 0x30 reg 0x0A = 0x%02x", val);
-            }
-            reg = 0x0B;
-            if (i2c_master_transmit_receive(dev, &reg, 1, &val, 1,
-                                            pdMS_TO_TICKS(100)) == ESP_OK) {
-                ESP_LOGI(TAG, "i2c: addr 0x30 reg 0x0B = 0x%02x", val);
-            }
-            i2c_master_bus_rm_device(dev);
-        }
-
         if (!found) {
             ESP_LOGW(TAG, "i2c: no devices found on camera bus");
         }
@@ -236,6 +224,8 @@ static void camera_self_test(void) {
     } else {
         ESP_LOGW(TAG, "i2c: init failed: %s", esp_err_to_name(err));
     }
+    esp_log_level_set("i2c.master", ESP_LOG_WARN);
+#endif
 
     ESP_LOGI(TAG, "camera self-test: init");
     if (camera_init_once() != ESP_OK) {
@@ -305,6 +295,8 @@ void app_main(void) {
     printf("Send: SNAP\\n\n");
 
     camera_self_test();
+    // Suppress info logs to keep the binary stream clean.
+    esp_log_level_set("*", ESP_LOG_ERROR);
 
     xTaskCreate(cmd_task, "cmd_task", 4096, NULL, 10, NULL);
 }

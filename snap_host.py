@@ -46,6 +46,19 @@ def main():
     time.sleep(0.2)
     ser.reset_input_buffer()
 
+    # Wait briefly for boot logs and READY banner to avoid sending SNAP too early.
+    start = time.time()
+    banner = bytearray()
+    while time.time() - start < 3.0:
+        chunk = ser.read(64)
+        if not chunk:
+            continue
+        banner += chunk
+        if b"READY snap_usb" in banner:
+            break
+        if len(banner) > 512:
+            banner = banner[-512:]
+
     ser.write(b"SNAP\n")
     ser.flush()
 
