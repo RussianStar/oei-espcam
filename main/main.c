@@ -10,7 +10,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
 
@@ -154,52 +154,53 @@ static void do_snap(void) {
 
 static void camera_self_test(void) {
     // Probe camera SCCB/I2C before esp_camera_init to help debug sensor detection.
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = CAM_I2C_PORT,
         .sda_io_num = SIOD_GPIO_NUM,
         .scl_io_num = SIOC_GPIO_NUM,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = 100000,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
 
-    esp_err_t err = i2c_param_config(CAM_I2C_PORT, &conf);
-    if (err == ESP_OK) {
-        err = i2c_driver_install(CAM_I2C_PORT, conf.mode, 0, 0, 0);
-    }
-
+    i2c_master_bus_handle_t bus = NULL;
+    esp_err_t err = i2c_new_master_bus(&bus_cfg, &bus);
     if (err == ESP_OK) {
         uint8_t found = 0;
         for (uint8_t addr = 0x08; addr <= 0x77; ++addr) {
-            i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-            i2c_master_start(cmd);
-            i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
-            i2c_master_stop(cmd);
-            esp_err_t r = i2c_master_cmd_begin(CAM_I2C_PORT, cmd, pdMS_TO_TICKS(50));
-            i2c_cmd_link_delete(cmd);
-            if (r == ESP_OK) {
+            if (i2c_master_probe(bus, addr, pdMS_TO_TICKS(50)) == ESP_OK) {
                 ESP_LOGI(TAG, "i2c: device found at 0x%02x", addr);
                 found = 1;
             }
         }
 
-        uint8_t val = 0;
-        uint8_t reg = 0x0A;
-        if (i2c_master_write_read_device(CAM_I2C_PORT, 0x30, &reg, 1, &val, 1,
-                                         pdMS_TO_TICKS(50)) == ESP_OK) {
-            ESP_LOGI(TAG, "i2c: addr 0x30 reg 0x0A = 0x%02x", val);
-        }
-        reg = 0x0B;
-        if (i2c_master_write_read_device(CAM_I2C_PORT, 0x30, &reg, 1, &val, 1,
-                                         pdMS_TO_TICKS(50)) == ESP_OK) {
-            ESP_LOGI(TAG, "i2c: addr 0x30 reg 0x0B = 0x%02x", val);
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = 0x30, // OV2640 default
+            .scl_speed_hz = 100000,
+            .scl_wait_us = 0,
+        };
+        i2c_master_dev_handle_t dev = NULL;
+        if (i2c_master_bus_add_device(bus, &dev_cfg, &dev) == ESP_OK) {
+            uint8_t val = 0;
+            uint8_t reg = 0x0A;
+            if (i2c_master_transmit_receive(dev, &reg, 1, &val, 1,
+                                            pdMS_TO_TICKS(50)) == ESP_OK) {
+                ESP_LOGI(TAG, "i2c: addr 0x30 reg 0x0A = 0x%02x", val);
+            }
+            reg = 0x0B;
+            if (i2c_master_transmit_receive(dev, &reg, 1, &val, 1,
+                                            pdMS_TO_TICKS(50)) == ESP_OK) {
+                ESP_LOGI(TAG, "i2c: addr 0x30 reg 0x0B = 0x%02x", val);
+            }
+            i2c_master_bus_rm_device(dev);
         }
 
         if (!found) {
             ESP_LOGW(TAG, "i2c: no devices found on camera bus");
         }
 
-        i2c_driver_delete(CAM_I2C_PORT);
+        i2c_del_master_bus(bus);
     } else {
         ESP_LOGW(TAG, "i2c: init failed: %s", esp_err_to_name(err));
     }
