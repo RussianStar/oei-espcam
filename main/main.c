@@ -8,7 +8,9 @@
 
 #include "esp_camera.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_psram.h"
 
 #include "driver/i2c_master.h"
 #include "driver/usb_serial_jtag.h"
@@ -82,7 +84,14 @@ static esp_err_t camera_init_once(void) {
 
     c.jpeg_quality = 12;
     c.fb_count = 1;
-    c.fb_location = CAMERA_FB_IN_PSRAM;
+    bool psram_ok = esp_psram_is_initialized();
+    if (psram_ok) {
+        c.fb_location = CAMERA_FB_IN_PSRAM;
+    } else {
+        ESP_LOGW(TAG, "psram not detected; using DRAM + smaller frame");
+        c.fb_location = CAMERA_FB_IN_DRAM;
+        c.frame_size = FRAMESIZE_VGA;
+    }
     c.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
     esp_err_t err = esp_camera_init(&c);
@@ -153,6 +162,11 @@ static void do_snap(void) {
 }
 
 static void camera_self_test(void) {
+    bool psram_ok = esp_psram_is_initialized();
+    size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG, "psram: %s, free=%u bytes", psram_ok ? "ok" : "not detected",
+             (unsigned)psram_free);
+
     // Probe camera SCCB/I2C before esp_camera_init to help debug sensor detection.
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port = CAM_I2C_PORT,
@@ -167,8 +181,10 @@ static void camera_self_test(void) {
     esp_err_t err = i2c_new_master_bus(&bus_cfg, &bus);
     if (err == ESP_OK) {
         uint8_t found = 0;
-        for (uint8_t addr = 0x08; addr <= 0x77; ++addr) {
-            if (i2c_master_probe(bus, addr, pdMS_TO_TICKS(50)) == ESP_OK) {
+        const uint8_t addrs[] = {0x30, 0x3c}; // OV2640 / OV5640 typical
+        for (size_t i = 0; i < sizeof(addrs); ++i) {
+            uint8_t addr = addrs[i];
+            if (i2c_master_probe(bus, addr, pdMS_TO_TICKS(100)) == ESP_OK) {
                 ESP_LOGI(TAG, "i2c: device found at 0x%02x", addr);
                 found = 1;
             }
@@ -185,12 +201,12 @@ static void camera_self_test(void) {
             uint8_t val = 0;
             uint8_t reg = 0x0A;
             if (i2c_master_transmit_receive(dev, &reg, 1, &val, 1,
-                                            pdMS_TO_TICKS(50)) == ESP_OK) {
+                                            pdMS_TO_TICKS(100)) == ESP_OK) {
                 ESP_LOGI(TAG, "i2c: addr 0x30 reg 0x0A = 0x%02x", val);
             }
             reg = 0x0B;
             if (i2c_master_transmit_receive(dev, &reg, 1, &val, 1,
-                                            pdMS_TO_TICKS(50)) == ESP_OK) {
+                                            pdMS_TO_TICKS(100)) == ESP_OK) {
                 ESP_LOGI(TAG, "i2c: addr 0x30 reg 0x0B = 0x%02x", val);
             }
             i2c_master_bus_rm_device(dev);
