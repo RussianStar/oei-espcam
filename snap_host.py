@@ -29,11 +29,24 @@ def sync_magic(ser):
             return
 
 
+def wait_for_magic(ser, timeout_s):
+    end = time.time() + timeout_s
+    window = bytearray()
+    while time.time() < end:
+        b = ser.read(1)
+        if not b:
+            continue
+        window = (window + b)[-4:]
+        if bytes(window) == MAGIC:
+            return True
+    return False
+
+
 def main():
     port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
     out = sys.argv[2] if len(sys.argv) > 2 else "out.jpg"
 
-    ser = serial.Serial(port, baudrate=115200, timeout=5)
+    ser = serial.Serial(port, baudrate=115200, timeout=1)
     # baudrate is ignored for USB CDC on many systems; keep it anyway.
 
     # Avoid toggling control lines (some host stacks reset boards on open).
@@ -44,26 +57,22 @@ def main():
         pass
 
     time.sleep(0.2)
-    ser.reset_input_buffer()
 
-    # Wait briefly for boot logs and READY banner to avoid sending SNAP too early.
-    start = time.time()
-    banner = bytearray()
-    while time.time() - start < 3.0:
-        chunk = ser.read(64)
-        if not chunk:
-            continue
-        banner += chunk
-        if b"READY snap_usb" in banner:
-            break
-        if len(banner) > 512:
-            banner = banner[-512:]
+    # First try to catch an auto-snap frame after reset/boot.
+    if not wait_for_magic(ser, 4.0):
+        # No auto frame seen; send SNAP explicitly.
+        ser.reset_input_buffer()
+        ser.write(b"SNAP\n")
+        ser.flush()
+        sync_magic(ser)
+    else:
+        # Already synced to magic from auto-snap.
+        pass
 
-    ser.write(b"SNAP\n")
-    ser.flush()
-
-    sync_magic(ser)
+    ser.timeout = 5
     (length,) = struct.unpack("<I", read_exact(ser, 4))
+    if length == 0 or length > 10 * 1024 * 1024:
+        raise RuntimeError(f"invalid length: {length}")
     jpg = read_exact(ser, length)
     tail = read_exact(ser, 4)
     if tail != END:
