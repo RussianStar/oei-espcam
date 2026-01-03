@@ -51,6 +51,10 @@ static const uint8_t END[4] = {'E', 'N', 'D', '0'};
 #define SNAP_I2C_PROBE 0
 #endif
 
+#ifndef SNAP_AUTOSNAP
+#define SNAP_AUTOSNAP 1
+#endif
+
 // OV2640 cannot do true 1920x1080; use UXGA (1600x1200) max.
 // If you install OV5640/OV3660, set FRAMESIZE_FHD.
 #ifndef SNAP_FRAME_SIZE
@@ -297,6 +301,11 @@ void app_main(void) {
     camera_self_test();
     // Suppress info logs to keep the binary stream clean.
     esp_log_level_set("*", ESP_LOG_ERROR);
+
+    if (SNAP_AUTOSNAP) {
+        vTaskDelay(pdMS_TO_TICKS(1500));
+        do_snap();
+    }
 
     xTaskCreate(cmd_task, "cmd_task", 4096, NULL, 10, NULL);
 }
