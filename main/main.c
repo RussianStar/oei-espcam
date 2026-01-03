@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "sdkconfig.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -10,7 +12,9 @@
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#if CONFIG_SPIRAM
 #include "esp_psram.h"
+#endif
 
 #include "driver/i2c_master.h"
 #include "driver/usb_serial_jtag.h"
@@ -51,6 +55,14 @@ static const uint8_t END[4] = {'E', 'N', 'D', '0'};
 
 static bool cam_ok = false;
 
+static bool psram_ready(void) {
+#if CONFIG_SPIRAM
+    return esp_psram_is_initialized();
+#else
+    return false;
+#endif
+}
+
 static esp_err_t camera_init_once(void) {
     if (cam_ok) {
         return ESP_OK;
@@ -84,7 +96,7 @@ static esp_err_t camera_init_once(void) {
 
     c.jpeg_quality = 12;
     c.fb_count = 1;
-    bool psram_ok = esp_psram_is_initialized();
+    bool psram_ok = psram_ready();
     if (psram_ok) {
         c.fb_location = CAMERA_FB_IN_PSRAM;
     } else {
@@ -162,8 +174,12 @@ static void do_snap(void) {
 }
 
 static void camera_self_test(void) {
-    bool psram_ok = esp_psram_is_initialized();
+    bool psram_ok = psram_ready();
+#if CONFIG_SPIRAM
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+#else
+    size_t psram_free = 0;
+#endif
     ESP_LOGI(TAG, "psram: %s, free=%u bytes", psram_ok ? "ok" : "not detected",
              (unsigned)psram_free);
 
