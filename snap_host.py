@@ -60,12 +60,15 @@ def main():
         pass
 
     time.sleep(0.2)
+
+    # Wait for READY banner so the device is fully booted before sending SNAP.
+    wait_for_token(ser, b"READY snap_usb", 5.0)
     ser.reset_input_buffer()
 
     ser.write(b"SNAP\n")
     ser.flush()
 
-    if not wait_for_token(ser, b"ACK\n", 2.0):
+    if not wait_for_token(ser, b"ACK\n", 3.0):
         raise TimeoutError("timeout waiting for ACK")
 
     if not sync_magic(ser, 2.0):

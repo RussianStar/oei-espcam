@@ -63,6 +63,10 @@ static const uint8_t END[4] = {'E', 'N', 'D', '0'};
 
 static bool cam_ok = false;
 
+#ifndef SNAP_DEINIT
+#define SNAP_DEINIT 0
+#endif
+
 static bool psram_ready(void) {
 #if CONFIG_SPIRAM
     return esp_psram_is_initialized();
@@ -181,8 +185,11 @@ static void do_snap(void) {
 
     esp_camera_fb_return(fb);
 
-    // Deinit to reduce idle load/heat between shots
-    camera_deinit();
+    if (SNAP_DEINIT) {
+        // Optional: deinit between shots. Some esp32-camera builds
+        // don't support re-init; keep disabled by default.
+        camera_deinit();
+    }
 }
 
 static void camera_self_test(void) {
