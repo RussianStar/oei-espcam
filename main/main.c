@@ -149,6 +149,27 @@ static void do_snap(void) {
     camera_deinit();
 }
 
+static void camera_self_test(void) {
+    ESP_LOGI(TAG, "camera self-test: init");
+    if (camera_init_once() != ESP_OK) {
+        ESP_LOGE(TAG, "camera self-test: init failed");
+        return;
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        ESP_LOGE(TAG, "camera self-test: fb_get failed");
+        camera_deinit();
+        return;
+    }
+
+    ESP_LOGI(TAG, "camera self-test: ok, len=%u format=%d size=%d",
+             (unsigned)fb->len, fb->format, fb->width * fb->height);
+    esp_camera_fb_return(fb);
+    camera_deinit();
+    ESP_LOGI(TAG, "camera self-test: done");
+}
+
 static void cmd_task(void *arg) {
     (void)arg;
     char line[32];
@@ -195,6 +216,8 @@ void app_main(void) {
 
     printf("READY snap_usb v1\n");
     printf("Send: SNAP\\n\n");
+
+    camera_self_test();
 
     xTaskCreate(cmd_task, "cmd_task", 4096, NULL, 10, NULL);
 }
