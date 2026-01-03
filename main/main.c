@@ -55,10 +55,15 @@ static const uint8_t END[4] = {'E', 'N', 'D', '0'};
 #define SNAP_AUTOSNAP 0
 #endif
 
-// OV2640 cannot do true 1920x1080; use UXGA (1600x1200) max.
-// If you install OV5640/OV3660, set FRAMESIZE_FHD.
+// Default for higher-res sensors (OV5640/OV3660).
+// OV3660 max is QXGA (2048x1536). OV5640 can go higher (QSXGA).
+// If you use OV2640, set SNAP_FRAME_SIZE=FRAMESIZE_UXGA.
 #ifndef SNAP_FRAME_SIZE
-#define SNAP_FRAME_SIZE FRAMESIZE_UXGA
+#define SNAP_FRAME_SIZE FRAMESIZE_QXGA
+#endif
+
+#ifndef SNAP_JPEG_QUALITY
+#define SNAP_JPEG_QUALITY 12
 #endif
 
 static bool cam_ok = false;
@@ -106,7 +111,7 @@ static esp_err_t camera_init_once(void) {
     c.pixel_format = PIXFORMAT_JPEG;
     c.frame_size = SNAP_FRAME_SIZE;
 
-    c.jpeg_quality = 12;
+    c.jpeg_quality = SNAP_JPEG_QUALITY;
     c.fb_count = 1;
     bool psram_ok = psram_ready();
     if (psram_ok) {
@@ -258,8 +263,8 @@ static void camera_self_test(void) {
         return;
     }
 
-    ESP_LOGI(TAG, "camera self-test: ok, len=%u format=%d size=%d",
-             (unsigned)fb->len, fb->format, fb->width * fb->height);
+    ESP_LOGI(TAG, "camera self-test: ok, len=%u format=%d %ux%u",
+             (unsigned)fb->len, fb->format, fb->width, fb->height);
     esp_camera_fb_return(fb);
     camera_deinit();
     ESP_LOGI(TAG, "camera self-test: done");
