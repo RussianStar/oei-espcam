@@ -52,7 +52,7 @@ static const uint8_t END[4] = {'E', 'N', 'D', '0'};
 #endif
 
 #ifndef SNAP_AUTOSNAP
-#define SNAP_AUTOSNAP 1
+#define SNAP_AUTOSNAP 0
 #endif
 
 // OV2640 cannot do true 1920x1080; use UXGA (1600x1200) max.
@@ -160,6 +160,10 @@ static void write_u32_le(uint32_t v) {
 
 static void do_snap(void) {
     if (camera_init_once() != ESP_OK) {
+        // Signal failure with empty frame.
+        write_all_usb(MAGIC, sizeof(MAGIC));
+        write_u32_le(0);
+        write_all_usb(END, sizeof(END));
         return;
     }
 
@@ -265,6 +269,8 @@ static void cmd_task(void *arg) {
             if (ch == '\n' || ch == '\r') {
                 line[n] = 0;
                 if (strcmp(line, "SNAP") == 0) {
+                    static const char ack[] = "ACK\n";
+                    write_all_usb(ack, sizeof(ack) - 1);
                     do_snap();
                 }
                 n = 0;

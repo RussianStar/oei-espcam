@@ -18,18 +18,7 @@ def read_exact(ser, n):
     return bytes(buf)
 
 
-def sync_magic(ser):
-    window = bytearray()
-    while True:
-        b = ser.read(1)
-        if not b:
-            raise TimeoutError("timeout waiting for JPG0")
-        window = (window + b)[-4:]
-        if bytes(window) == MAGIC:
-            return
-
-
-def wait_for_magic(ser, timeout_s):
+def sync_magic(ser, timeout_s):
     end = time.time() + timeout_s
     window = bytearray()
     while time.time() < end:
@@ -38,6 +27,20 @@ def wait_for_magic(ser, timeout_s):
             continue
         window = (window + b)[-4:]
         if bytes(window) == MAGIC:
+            return True
+    return False
+
+
+def wait_for_token(ser, token, timeout_s):
+    end = time.time() + timeout_s
+    window = bytearray()
+    n = len(token)
+    while time.time() < end:
+        b = ser.read(1)
+        if not b:
+            continue
+        window = (window + b)[-n:]
+        if bytes(window) == token:
             return True
     return False
 
@@ -57,21 +60,22 @@ def main():
         pass
 
     time.sleep(0.2)
+    ser.reset_input_buffer()
 
-    # First try to catch an auto-snap frame after reset/boot.
-    if not wait_for_magic(ser, 4.0):
-        # No auto frame seen; send SNAP explicitly.
-        ser.reset_input_buffer()
-        ser.write(b"SNAP\n")
-        ser.flush()
-        sync_magic(ser)
-    else:
-        # Already synced to magic from auto-snap.
-        pass
+    ser.write(b"SNAP\n")
+    ser.flush()
+
+    if not wait_for_token(ser, b"ACK\n", 2.0):
+        raise TimeoutError("timeout waiting for ACK")
+
+    if not sync_magic(ser, 2.0):
+        raise TimeoutError("timeout waiting for JPG0")
 
     ser.timeout = 5
     (length,) = struct.unpack("<I", read_exact(ser, 4))
-    if length == 0 or length > 10 * 1024 * 1024:
+    if length == 0:
+        raise RuntimeError("device reported capture failure (length=0)")
+    if length > 10 * 1024 * 1024:
         raise RuntimeError(f"invalid length: {length}")
     jpg = read_exact(ser, length)
     tail = read_exact(ser, 4)
