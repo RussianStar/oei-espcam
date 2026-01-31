@@ -1,0 +1,480 @@
+---
+- name: Setup ESP-IDF on Raspberry Pi OS and flash all connected ESP32 devices
+  hosts: all
+  become: true
+  vars:
+    esp_prereqs:
+      - git
+      - wget
+      - flex
+      - bison
+      - gperf
+      - python3
+      - python3-pip
+      - python3-venv
+      - python3-setuptools
+      - python3-serial
+      - cmake
+      - ninja-build
+      - ccache
+      - libffi-dev
+      - libssl-dev
+      - libusb-1.0-0
+      - libusb-1.0-0-dev
+      - pkg-config
+      - dfu-util
+      - udev
+      - uhubctl
+      - gcc
+      - g++
+      - make
+      - libreadline-dev
+      - rsync
+    esp_user: "{{ ansible_user | default('pi') }}"
+    esp_group: "{{ esp_user }}"
+    esp_idf_version: "v5.2.2"
+    esp_idf_path: "/home/{{ esp_user }}/esp/esp-idf"
+    esp_tools_path: "/home/{{ esp_user }}/.espressif"
+    idf_targets: "esp32,esp32s3"
+    idf_target: "esp32s3"
+    project_path: "/home/{{ esp_user }}/esp/project"
+    local_project_path: "{{ playbook_dir }}/.."
+    local_user: "{{ lookup('env','USER') | default('root', true) }}"
+    local_home: "{{ lookup('env','HOME') | default('/root', true) }}"
+    local_esp_idf_path: "{{ local_home }}/esp/esp-idf"
+    local_esp_tools_path: "{{ local_home }}/.espressif"
+    local_build_path: "{{ local_project_path }}/build"
+    # Fast flash mode: skip setup/build/sync steps when you just want to flash.
+    fast_flash: true
+    local_setup: true
+    local_build: true
+    remote_idf_install: false
+    remote_install_esptool: true
+    remote_esptool_package: "esptool"
+    remote_esptool_pip_name: "esptool"
+    remote_esptool_venv: "/home/{{ esp_user }}/.venv/esptool"
+    remote_esptool_python: "/usr/bin/python3"
+    sync_project: true
+    flash_baud: "460800"
+    flash_parallel: true
+    flash_async_timeout: 900
+    esp_port_probe: true
+    esp_port_glob: "/dev/ttyAC*"
+    usb_reset_after_flash: true
+    snap_after_flash: true
+
+    # Build behavior
+    idf_fullclean: false
+
+    # Derived switches for fast path (skip setup, keep build/sync/flash).
+    do_prereqs: "{{ not fast_flash }}"
+    do_udev_rules: "{{ not fast_flash }}"
+    do_local_setup: "{{ local_setup | bool and (not fast_flash) }}"
+    do_local_build: "{{ local_build | bool }}"
+    do_sync: "{{ sync_project | bool }}"
+    do_remote_esptool: "{{ remote_install_esptool | bool and (not fast_flash) }}"
+    do_usb_reset: "{{ usb_reset_after_flash | bool }}"
+    do_snap_after_flash: "{{ snap_after_flash | bool }}"
+
+  tasks:
+    - name: Install prerequisites (remote)
+      ansible.builtin.apt:
+        update_cache: true
+        name: "{{ esp_prereqs }}"
+      when: do_prereqs | bool
+
+    - name: Ensure user is in serial groups
+      ansible.builtin.user:
+        name: "{{ esp_user }}"
+        groups: "dialout,plugdev"
+        append: true
+      when: do_prereqs | bool
+
+    - name: Ensure ESP base dir exists
+      ansible.builtin.file:
+        path: "/home/{{ esp_user }}/esp"
+        state: directory
+        owner: "{{ esp_user }}"
+        group: "{{ esp_group }}"
+        mode: "0755"
+      when: (remote_idf_install | bool) and (not fast_flash)
+
+    - name: Clone ESP-IDF
+      ansible.builtin.git:
+        repo: "https://github.com/espressif/esp-idf.git"
+        dest: "{{ esp_idf_path }}"
+        version: "{{ esp_idf_version }}"
+        recursive: true
+        update: true
+      become_user: "{{ esp_user }}"
+      when: remote_idf_install | bool and (not fast_flash)
+
+    - name: Install ESP-IDF tools
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ./install.sh {{ idf_targets }}
+      args:
+        chdir: "{{ esp_idf_path }}"
+        executable: /bin/bash
+      environment:
+        IDF_TOOLS_PATH: "{{ esp_tools_path }}"
+      become_user: "{{ esp_user }}"
+      when: remote_idf_install | bool and (not fast_flash)
+
+    - name: Find ESP udev rules
+      ansible.builtin.find:
+        paths: "{{ esp_idf_path }}/tools/udev"
+        patterns:
+          - "99-esp32.rules"
+          - "99-esp.rules"
+        file_type: file
+      register: udev_rules
+      when: remote_idf_install | bool and (not fast_flash)
+
+    - name: Download udev rules (fallback)
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/espressif/esp-idf/{{ esp_idf_version }}/tools/udev/99-esp32.rules"
+        dest: /tmp/99-esp32.rules
+        mode: "0644"
+      when: do_udev_rules | bool and ((not remote_idf_install | bool) or (udev_rules is defined and (udev_rules.matched | int == 0)))
+      register: udev_download
+      failed_when: false
+
+    - name: Install udev rules for ESP devices (repo)
+      ansible.builtin.copy:
+        src: "{{ (udev_rules.files[0].path if (udev_rules.matched | default(0) | int) > 0 else '/tmp/99-esp32.rules') }}"
+        dest: /etc/udev/rules.d/99-esp32.rules
+        remote_src: true
+        mode: "0644"
+      when: do_udev_rules | bool and remote_idf_install | bool and (udev_rules.matched | int > 0)
+
+    - name: Install udev rules for ESP devices (download)
+      ansible.builtin.copy:
+        src: /tmp/99-esp32.rules
+        dest: /etc/udev/rules.d/99-esp32.rules
+        remote_src: true
+        mode: "0644"
+      when: do_udev_rules | bool and ((not remote_idf_install | bool) or (udev_rules is defined and (udev_rules.matched | int == 0))) and (udev_download is defined and (udev_download.status_code | default(0) | int == 200))
+
+    - name: Install udev rules for ESP devices (minimal fallback)
+      ansible.builtin.copy:
+        dest: /etc/udev/rules.d/99-esp32.rules
+        mode: "0644"
+        content: |
+          # Minimal ESP32 udev rules fallback
+          SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", MODE:="0666", GROUP:="dialout"
+          SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", MODE:="0666", GROUP:="dialout"
+          SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE:="0666", GROUP:="dialout"
+          SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", MODE:="0666", GROUP:="dialout"
+      when: do_udev_rules | bool and ((not remote_idf_install | bool) or (udev_rules is defined and (udev_rules.matched | int == 0))) and ((udev_download is not defined) or (udev_download.status_code | default(0) | int != 200))
+
+    - name: Reload udev rules
+      ansible.builtin.shell: |
+        set -euo pipefail
+        udevadm control --reload-rules
+        udevadm trigger
+      args:
+        executable: /bin/bash
+      when: do_udev_rules | bool
+
+    - name: Install esptool on remote
+      block:
+        - name: Install esptool via apt
+          ansible.builtin.apt:
+            update_cache: true
+            name: "{{ remote_esptool_package }}"
+            state: present
+      rescue:
+        - name: Install venv prereqs for esptool
+          ansible.builtin.apt:
+            update_cache: true
+            name:
+              - python3-venv
+              - python3-pip
+            state: present
+        - name: Install esptool in venv
+          ansible.builtin.pip:
+            name: "{{ remote_esptool_pip_name }}"
+            virtualenv: "{{ remote_esptool_venv }}"
+            virtualenv_command: /usr/bin/python3 -m venv
+        - name: Use venv python for esptool
+          ansible.builtin.set_fact:
+            remote_esptool_python: "{{ remote_esptool_venv }}/bin/python"
+      when: do_remote_esptool | bool
+
+    - name: Check local project path
+      ansible.builtin.stat:
+        path: "{{ local_project_path }}/CMakeLists.txt"
+      register: local_project_stat
+      delegate_to: localhost
+      run_once: true
+      when: (do_sync | bool) or (do_local_build | bool)
+
+    - name: Fail if local project not found
+      ansible.builtin.fail:
+        msg: "local_project_path missing or not an ESP-IDF project: {{ local_project_path }}"
+      when: ((do_sync | bool) or (do_local_build | bool)) and (not local_project_stat.stat.exists)
+      run_once: true
+
+    - name: Install prerequisites (local)
+      ansible.builtin.apt:
+        update_cache: true
+        name: "{{ esp_prereqs }}"
+      delegate_to: localhost
+      become: true
+      run_once: true
+      when: do_local_setup | bool
+
+    - name: Ensure local ESP base dir exists
+      ansible.builtin.file:
+        path: "{{ local_home }}/esp"
+        state: directory
+        owner: "{{ local_user }}"
+        group: "{{ local_user }}"
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: do_local_setup | bool
+
+    - name: Clone ESP-IDF (local)
+      ansible.builtin.git:
+        repo: "https://github.com/espressif/esp-idf.git"
+        dest: "{{ local_esp_idf_path }}"
+        version: "{{ esp_idf_version }}"
+        recursive: true
+        update: true
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: do_local_setup | bool
+
+    - name: Install ESP-IDF tools (local)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ./install.sh {{ idf_targets }}
+      args:
+        chdir: "{{ local_esp_idf_path }}"
+        executable: /bin/bash
+      environment:
+        IDF_TOOLS_PATH: "{{ local_esp_tools_path }}"
+        VIRTUAL_ENV: ""
+        CONDA_PREFIX: ""
+        CONDA_DEFAULT_ENV: ""
+        PYTHONHOME: ""
+        PYTHONPATH: ""
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: do_local_setup | bool
+
+    - name: Build firmware locally
+      ansible.builtin.shell: |
+        set -euo pipefail
+        . "{{ local_esp_idf_path }}/export.sh"
+        if [ "{{ idf_fullclean | bool }}" = "true" ]; then
+          idf.py -C "{{ local_project_path }}" fullclean || true
+        fi
+        idf.py -C "{{ local_project_path }}" -DIDF_TARGET="{{ idf_target }}" build
+      args:
+        executable: /bin/bash
+      environment:
+        IDF_TOOLS_PATH: "{{ local_esp_tools_path }}"
+        IDF_COMPONENT_MANAGER: "1"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: do_local_build | bool
+
+    - name: Check local build artifacts
+      ansible.builtin.stat:
+        path: "{{ local_build_path }}/flasher_args.json"
+      register: local_build_stat
+      delegate_to: localhost
+      run_once: true
+      when: do_local_build | bool
+
+    - name: Fail if local build artifacts missing
+      ansible.builtin.fail:
+        msg: "Local build artifacts missing: {{ local_build_path }}/flasher_args.json"
+      when: do_local_build | bool and (not local_build_stat.stat.exists)
+      delegate_to: localhost
+      run_once: true
+
+    - name: Ensure project path exists on remote
+      ansible.builtin.file:
+        path: "{{ project_path }}"
+        state: directory
+        owner: "{{ esp_user }}"
+        group: "{{ esp_group }}"
+        mode: "0755"
+      when: do_sync | bool
+
+    - name: Sync project to remote
+      ansible.posix.synchronize:
+        src: "{{ local_project_path }}/"
+        dest: "{{ project_path }}/"
+        delete: false
+        recursive: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=__pycache__"
+          - "--exclude=*.pyc"
+      delegate_to: localhost
+      when: do_sync | bool
+
+    - name: Check project path exists
+      ansible.builtin.stat:
+        path: "{{ project_path }}/CMakeLists.txt"
+      register: project_stat
+
+    - name: Fail if project not found
+      ansible.builtin.fail:
+        msg: "project_path missing or not an ESP-IDF project: {{ project_path }}"
+      when: not project_stat.stat.exists
+
+    - name: Check remote build artifacts
+      ansible.builtin.shell: |
+        set -euo pipefail
+        test -f "{{ project_path }}/build/bootloader/bootloader.bin"
+        test -f "{{ project_path }}/build/partition_table/partition-table.bin"
+        test -f "{{ project_path }}/build/snap_usb.bin"
+      args:
+        executable: /bin/bash
+
+    - name: Detect connected ESP32 devices
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ports="$(ls -1 {{ esp_port_glob }} 2>/dev/null || true)"
+        if [ -z "$ports" ]; then
+          exit 0
+        fi
+        if [ "{{ esp_port_probe | bool }}" = "true" ]; then
+          ok_ports=""
+          for p in $ports; do
+            if {{ remote_esptool_python }} -m esptool -p "$p" flash_id >/dev/null 2>&1; then
+              ok_ports="${ok_ports}${p}\n"
+            fi
+          done
+          if [ -n "$ok_ports" ]; then
+            printf "%b" "$ok_ports"
+          else
+            echo "WARN: esptool probe failed for all ports; using raw /dev/tty* list" >&2
+            printf "%s\n" $ports
+          fi
+        else
+          printf "%s\n" $ports
+        fi
+      args:
+        executable: /bin/bash
+      register: esp_ports
+      changed_when: false
+      become_user: "{{ esp_user }}"
+
+    - name: Fail if no ESP32 devices detected
+      ansible.builtin.fail:
+        msg: "No ESP32 devices detected on {{ esp_port_glob }}"
+      when: esp_ports.stdout_lines | length == 0
+
+    - name: Flash firmware to all connected devices (parallel)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ remote_esptool_python }} -m esptool --chip esp32s3 -p "{{ item }}" -b "{{ flash_baud }}" \
+          --no-stub --before default_reset --after hard_reset \
+          write_flash --flash_mode dio --flash_freq 80m --flash_size 2MB \
+          0x0 "{{ project_path }}/build/bootloader/bootloader.bin" \
+          0x8000 "{{ project_path }}/build/partition_table/partition-table.bin" \
+          0x10000 "{{ project_path }}/build/snap_usb.bin"
+      args:
+        executable: /bin/bash
+      loop: "{{ esp_ports.stdout_lines }}"
+      become_user: "{{ esp_user }}"
+      async: "{{ flash_async_timeout }}"
+      poll: 0
+      register: flash_jobs
+      when: flash_parallel | bool
+
+    - name: Wait for flash jobs
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: flash_results
+      until: flash_results.finished
+      retries: 300
+      delay: 2
+      loop: "{{ flash_jobs.results }}"
+      become_user: "{{ esp_user }}"
+      when: flash_parallel | bool
+
+    - name: Flash firmware to all connected devices (sequential)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        {{ remote_esptool_python }} -m esptool --chip esp32s3 -p "{{ item }}" -b "{{ flash_baud }}" \
+          --no-stub --before default_reset --after hard_reset \
+          write_flash --flash_mode dio --flash_freq 80m --flash_size 2MB \
+          0x0 "{{ project_path }}/build/bootloader/bootloader.bin" \
+          0x8000 "{{ project_path }}/build/partition_table/partition-table.bin" \
+          0x10000 "{{ project_path }}/build/snap_usb.bin"
+      args:
+        executable: /bin/bash
+      loop: "{{ esp_ports.stdout_lines }}"
+      become_user: "{{ esp_user }}"
+      when: not (flash_parallel | bool)
+
+    - name: Reset all USB hubs (power cycle)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        if ! command -v uhubctl >/dev/null 2>&1; then
+          echo "uhubctl not found" >&2
+          exit 1
+        fi
+        hubs="$(sudo uhubctl | awk '/Current status for hub/ && $0 ~ /ppps/ {print $5}')"
+        if [ -z "$hubs" ]; then
+          echo "No power-switchable hubs detected; skipping reset" >&2
+          exit 0
+        fi
+        for h in $hubs; do
+          if ! sudo uhubctl -l "$h" -a cycle; then
+            echo "WARN: uhubctl failed for hub $h" >&2
+          fi
+        done
+        sleep 2
+      args:
+        executable: /bin/bash
+
+    - name: Detect connected ESP32 devices after USB reset
+      ansible.builtin.shell: |
+        set -euo pipefail
+        ports="$(ls -1 {{ esp_port_glob }} 2>/dev/null || true)"
+        if [ -z "$ports" ]; then
+          exit 0
+        fi
+        if [ "{{ esp_port_probe | bool }}" = "true" ]; then
+          ok_ports=""
+          for p in $ports; do
+            if {{ remote_esptool_python }} -m esptool -p "$p" flash_id >/dev/null 2>&1; then
+              ok_ports="${ok_ports}${p}\n"
+            fi
+          done
+          if [ -n "$ok_ports" ]; then
+            printf "%b" "$ok_ports"
+          else
+            echo "WARN: esptool probe failed for all ports; using raw /dev/tty* list" >&2
+            printf "%s\n" $ports
+          fi
+        else
+          printf "%s\n" $ports
+        fi
+      args:
+        executable: /bin/bash
+      register: esp_ports_after_reset
+      changed_when: false
+      become_user: "{{ esp_user }}"
+
+    - name: Capture image from each device
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 "{{ project_path }}/snap_capture.py" --reset --wait=10 "{{ item }}" "{{ project_path }}/snap_{{ item | basename }}.jpg"
+      args:
+        executable: /bin/bash
+      loop: "{{ esp_ports_after_reset.stdout_lines }}"
+      become_user: "{{ esp_user }}"

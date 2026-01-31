@@ -1,3 +1,4 @@
+import os
 import struct
 import sys
 import time
@@ -49,25 +50,82 @@ def wait_for_token(ser, token, timeout_s):
     return False
 
 
-def main():
-    port = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyACM0"
-    out = sys.argv[2] if len(sys.argv) > 2 else "out.jpg"
+def wait_for_port(path, timeout_s):
+    end = time.time() + timeout_s
+    while time.time() < end:
+        if os.path.exists(path):
+            return True
+        time.sleep(0.1)
+    return False
 
+
+def open_serial(port):
     ser = serial.Serial(port, baudrate=115200, timeout=1)
-    # baudrate is ignored for USB CDC on many systems; keep it anyway.
-
-    # Avoid toggling control lines (some host stacks reset boards on open).
     try:
-        ser.setDTR(False)
+        ser.setDTR(True)
         ser.setRTS(False)
     except Exception:
         pass
+    return ser
+
+
+def main():
+    args = sys.argv[1:]
+    port = "/dev/ttyACM0"
+    out = "out.jpg"
+    sleep_after = False
+    sleep_only = False
+    do_reset = False
+    wait_port_s = 0.0
+    port_set = False
+    out_set = False
+    for a in args:
+        if a == "--sleep":
+            sleep_after = True
+        elif a == "--sleep-only":
+            sleep_only = True
+        elif a == "--reset":
+            do_reset = True
+        elif a.startswith("--wait="):
+            try:
+                wait_port_s = float(a.split("=", 1)[1])
+            except ValueError:
+                pass
+        elif not port_set:
+            port = a
+            port_set = True
+        elif not out_set:
+            out = a
+            out_set = True
+
+    if wait_port_s > 0:
+        if not wait_for_port(port, wait_port_s):
+            raise TimeoutError(f"port not found: {port}")
+
+    ser = open_serial(port)
+    # baudrate is ignored for USB CDC on many systems; keep it anyway.
+
+    if do_reset:
+        ser.close()
+        time.sleep(0.3)
+        if wait_port_s > 0:
+            if not wait_for_port(port, wait_port_s):
+                raise TimeoutError(f"port not found after reset: {port}")
+        ser = open_serial(port)
 
     time.sleep(0.2)
 
     # Wait for READY banner so the device is fully booted before sending SNAP.
     wait_for_token(ser, b"READY snap_usb", 5.0)
     ser.reset_input_buffer()
+
+    if sleep_only:
+        ser.write(b"SLEEP\n")
+        ser.flush()
+        if not wait_for_token(ser, b"ACK\n", 3.0):
+            raise TimeoutError("timeout waiting for ACK (SLEEP)")
+        print("camera deinit requested")
+        return
 
     ser.write(b"SNAP\n")
     ser.flush()
@@ -91,6 +149,12 @@ def main():
 
     with open(out, "wb") as f:
         f.write(jpg)
+
+    if sleep_after:
+        ser.write(b"SLEEP\n")
+        ser.flush()
+        if not wait_for_token(ser, b"ACK\n", 3.0):
+            raise TimeoutError("timeout waiting for ACK (SLEEP)")
 
     print(f"wrote {out} ({len(jpg)} bytes)")
 
