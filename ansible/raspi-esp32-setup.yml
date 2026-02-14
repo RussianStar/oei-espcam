@@ -58,13 +58,16 @@
     flash_baud: "460800"
     flash_parallel: true
     flash_async_timeout: 900
+    snap_parallel: true
+    snap_async_timeout: 900
     esp_port_probe: true
     esp_port_glob: "/dev/ttyAC*"
     usb_reset_after_flash: true
     snap_after_flash: true
+    snap_logs_only: true
 
     # Build behavior
-    idf_fullclean: false
+    idf_fullclean: true
 
     # Derived switches for fast path (skip setup, keep build/sync/flash).
     do_prereqs: "{{ not fast_flash }}"
@@ -275,7 +278,7 @@
         if [ "{{ idf_fullclean | bool }}" = "true" ]; then
           idf.py -C "{{ local_project_path }}" fullclean || true
         fi
-        idf.py -C "{{ local_project_path }}" -DIDF_TARGET="{{ idf_target }}" build
+        idf.py -C "{{ local_project_path }}" -DIDF_TARGET="{{ idf_target }}" {% if snap_logs_only | bool %}-DSNAP_LOGS_ONLY=1{% endif %} build
       args:
         executable: /bin/bash
       environment:
@@ -470,7 +473,7 @@
       changed_when: false
       become_user: "{{ esp_user }}"
 
-    - name: Capture image from each device
+    - name: Capture image from each device (parallel)
       ansible.builtin.shell: |
         set -euo pipefail
         python3 "{{ project_path }}/snap_capture.py" --reset --wait=10 "{{ item }}" "{{ project_path }}/snap_{{ item | basename }}.jpg"
@@ -478,3 +481,28 @@
         executable: /bin/bash
       loop: "{{ esp_ports_after_reset.stdout_lines }}"
       become_user: "{{ esp_user }}"
+      async: "{{ snap_async_timeout }}"
+      poll: 0
+      register: snap_jobs
+      when: snap_parallel | bool
+
+    - name: Wait for capture jobs
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: snap_results
+      until: snap_results.finished
+      retries: 300
+      delay: 2
+      loop: "{{ snap_jobs.results }}"
+      become_user: "{{ esp_user }}"
+      when: snap_parallel | bool
+
+    - name: Capture image from each device (sequential)
+      ansible.builtin.shell: |
+        set -euo pipefail
+        python3 "{{ project_path }}/snap_capture.py" --reset --wait=10 "{{ item }}" "{{ project_path }}/snap_{{ item | basename }}.jpg"
+      args:
+        executable: /bin/bash
+      loop: "{{ esp_ports_after_reset.stdout_lines }}"
+      become_user: "{{ esp_user }}"
+      when: not (snap_parallel | bool)
