@@ -1,4 +1,5 @@
 import argparse
+import glob
 import os
 import sys
 import time
@@ -9,17 +10,48 @@ import serial
 def wait_for_port(path, timeout_s):
     end = time.time() + timeout_s
     while time.time() < end:
-        if os.path.exists(path):
-            return True
+        if path:
+            if os.path.exists(path):
+                return path
+        else:
+            ports = discover_serial_ports()
+            if ports:
+                return ports[0]
         time.sleep(0.1)
-    return False
+    return None
+
+
+def discover_serial_ports():
+    if os.name != "posix":
+        return []
+    candidates = []
+    for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyS*"):
+        candidates.extend(sorted(glob.glob(pattern)))
+    return candidates
+
+
+def resolve_port(path):
+    if path and os.path.exists(path):
+        return path
+    ports = discover_serial_ports()
+    if ports:
+        return ports[0]
+    return path
+
+
+def is_usb_uart_bridge(port):
+    return isinstance(port, str) and "/ttyUSB" in port
 
 
 def open_serial(port, baud):
     ser = serial.Serial(port, baudrate=baud, timeout=1)
     try:
-        ser.setDTR(True)
-        ser.setRTS(False)
+        if is_usb_uart_bridge(port):
+            ser.setDTR(False)
+            ser.setRTS(False)
+        else:
+            ser.setDTR(True)
+            ser.setRTS(False)
     except Exception:
         pass
     return ser
@@ -27,7 +59,7 @@ def open_serial(port, baud):
 
 def main():
     parser = argparse.ArgumentParser(description="Stream ESP32 debug output over USB serial")
-    parser.add_argument("port", nargs="?", default="/dev/ttyACM0")
+    parser.add_argument("port", nargs="?", default=None)
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--wait", type=float, default=0.0, help="wait for port (seconds)")
     parser.add_argument("--reset", action="store_true")
@@ -36,8 +68,13 @@ def main():
     args = parser.parse_args()
 
     if args.wait > 0:
-        if not wait_for_port(args.port, args.wait):
-            raise TimeoutError(f"port not found: {args.port}")
+        args.port = wait_for_port(args.port, args.wait) if args.port else wait_for_port(None, args.wait)
+        if not args.port:
+            raise TimeoutError("port not found: auto-detect")
+    else:
+        args.port = resolve_port(args.port)
+    if not args.port:
+        raise TimeoutError("no serial port found")
 
     ser = open_serial(args.port, args.baud)
 

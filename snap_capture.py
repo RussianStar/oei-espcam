@@ -132,20 +132,113 @@ def resolve_port(path):
     return path
 
 
+def is_usb_uart_bridge(port):
+    return isinstance(port, str) and "/ttyUSB" in port
+
+
 def open_serial(port, baud, write_timeout):
     ser = serial.Serial(port, baudrate=baud, timeout=1, write_timeout=write_timeout)
     try:
-        # Keep DTR asserted so the device RX path stays active.
-        ser.setDTR(True)
-        ser.setRTS(False)
+        # CH34x/CP210x reset wiring on ESP32-CAM can enter download mode if DTR is asserted.
+        # Keep bridge lines deasserted on ttyUSB, keep old behavior elsewhere.
+        if is_usb_uart_bridge(port):
+            ser.setDTR(False)
+            ser.setRTS(False)
+        else:
+            ser.setDTR(True)
+            ser.setRTS(False)
     except Exception:
         pass
     return ser
 
 
+def set_dtr_rts(ser, dtr=None, rts=None):
+    try:
+        if dtr is not None:
+            ser.setDTR(dtr)
+        if rts is not None:
+            ser.setRTS(rts)
+        return True
+    except Exception:
+        return False
+
+
+def pulse_reset_signals(ser):
+    if not set_dtr_rts(ser, dtr=False, rts=False):
+        return False
+    time.sleep(0.05)
+    if not set_dtr_rts(ser, dtr=True, rts=False):
+        return False
+    return True
+
+
+def wait_for_port_state(path, timeout_s, should_exist):
+    end = time.time() + timeout_s
+    while time.time() < end:
+        if os.path.exists(path) == should_exist:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def reopen_after_reset(port, old_ser, baud, write_timeout, wait_s):
+    # Try explicit firmware reset first; safer on ESP32-CAM usb-uart bridges.
+    soft_reset_sent = False
+    try:
+        cmd_ser = old_ser if old_ser is not None else open_serial(port, baud, write_timeout)
+        cmd_ser.write(b"RESET\n")
+        cmd_ser.flush()
+        soft_reset_sent = True
+    except Exception:
+        pass
+    finally:
+        try:
+            if old_ser is None and "cmd_ser" in locals() and cmd_ser is not None:
+                cmd_ser.close()
+        except Exception:
+            pass
+
+    # Fallback to line toggles on non-ttyUSB only; ttyUSB tends to land in boot:0x3.
+    if not soft_reset_sent and not is_usb_uart_bridge(port):
+        sig_ser = old_ser
+        sig_ser_owned = False
+        try:
+            if sig_ser is None:
+                sig_ser = open_serial(port, baud, write_timeout)
+                sig_ser_owned = True
+            pulse_reset_signals(sig_ser)
+            try:
+                sig_ser.flush()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            if sig_ser is not None and (sig_ser is not old_ser or sig_ser_owned):
+                try:
+                    sig_ser.close()
+                except Exception:
+                    pass
+
+    # Some adapters drop/recreate the tty on reset, some do not.
+    if wait_s > 0:
+        wait_for_port_state(port, min(1.0, wait_s), should_exist=False)
+        if not wait_for_port_state(port, max(0.0, wait_s - 1.0), should_exist=True):
+            raise TimeoutError(f"port did not come back after reset: {port}")
+
+    if old_ser is not None:
+        try:
+            old_ser.close()
+        except Exception:
+            pass
+    time.sleep(0.2)
+    return open_serial(port, baud, write_timeout)
+
+
 def print_boot_log_until_ready(ser, timeout_s, log_f=None):
     end = time.time() + timeout_s
     ready = False
+    saw_download_mode = False
     while time.time() < end:
         line = ser.readline()
         _log_bytes(log_f, line)
@@ -155,10 +248,12 @@ def print_boot_log_until_ready(ser, timeout_s, log_f=None):
         text = line.decode("utf-8", errors="replace").rstrip("\r\n")
         print(f"[{ts}] {text}")
         sys.stdout.flush()
-        if "READY snap_usb" in text or "BOOT" in text or "Send: SNAP" in text:
+        if "DOWNLOAD_BOOT" in text or "boot:0x3" in text:
+            saw_download_mode = True
+        if "READY snap_usb" in text or "Send: SNAP" in text:
             ready = True
             break
-    return ready
+    return ready, saw_download_mode
 
 
 def main():
@@ -207,17 +302,7 @@ def main():
         ser = open_serial(args.port, args.baud, args.write_timeout)
 
         if args.reset:
-            try:
-                ser.close()
-            except OSError:
-                pass
-            time.sleep(0.3)
-            if args.wait > 0:
-                wait_port = wait_for_port(None if not args.port else args.port, args.wait)
-                if not wait_port:
-                    raise TimeoutError(f"port not found after reset: {args.port}")
-                args.port = wait_port
-            ser = open_serial(args.port, args.baud, args.write_timeout)
+            ser = reopen_after_reset(args.port, ser, args.baud, args.write_timeout, args.wait if args.wait > 0 else 2.0)
 
         time.sleep(0.2)
         try:
@@ -227,8 +312,10 @@ def main():
             pass
 
         print("Waiting for READY...")
-        ready = print_boot_log_until_ready(ser, args.ready_timeout, log_f=log_f)
+        ready, saw_download_mode = print_boot_log_until_ready(ser, args.ready_timeout, log_f=log_f)
         if not ready:
+            if saw_download_mode:
+                raise RuntimeError("chip is in UART download mode (boot:0x3). Release IO0/BOOT and reset.")
             print("READY not seen; trying sync probe")
             try:
                 ser.write(b"PING\n")

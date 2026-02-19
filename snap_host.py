@@ -79,6 +79,10 @@ def resolve_port(path):
     return path
 
 
+def is_usb_uart_bridge(port):
+    return isinstance(port, str) and "/ttyUSB" in port
+
+
 def wait_for_port(path, timeout_s):
     end = time.time() + timeout_s
     while time.time() < end:
@@ -96,11 +100,81 @@ def wait_for_port(path, timeout_s):
 def open_serial(port):
     ser = serial.Serial(port, baudrate=115200, timeout=1)
     try:
-        ser.setDTR(True)
-        ser.setRTS(False)
+        # CH34x/CP210x reset wiring on ESP32-CAM can enter download mode if DTR is asserted.
+        if is_usb_uart_bridge(port):
+            ser.setDTR(False)
+            ser.setRTS(False)
+        else:
+            ser.setDTR(True)
+            ser.setRTS(False)
     except Exception:
         pass
     return ser
+
+
+def set_dtr_rts(ser, dtr=None, rts=None):
+    try:
+        if dtr is not None:
+            ser.setDTR(dtr)
+        if rts is not None:
+            ser.setRTS(rts)
+        return True
+    except Exception:
+        return False
+
+
+def pulse_reset_signals(port):
+    try:
+        ser = open_serial(port)
+    except Exception:
+        return False
+
+    ok = False
+    try:
+        if set_dtr_rts(ser, dtr=False, rts=False):
+            time.sleep(0.05)
+            if set_dtr_rts(ser, dtr=True, rts=False):
+                ok = True
+    finally:
+        try:
+            ser.close()
+        except Exception:
+            pass
+    return ok
+
+
+def wait_for_port_state(path, timeout_s, should_exist):
+    end = time.time() + timeout_s
+    while time.time() < end:
+        if os.path.exists(path) == should_exist:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def reopen_after_reset(port, wait_s):
+    # Prefer firmware reset first; safer on ESP32-CAM usb-uart bridges.
+    soft_reset_sent = False
+    try:
+        with open_serial(port) as ser:
+            ser.write(b"RESET\n")
+            ser.flush()
+            soft_reset_sent = True
+    except Exception:
+        pass
+
+    # Fallback to line toggles on non-ttyUSB only; ttyUSB tends to land in boot:0x3.
+    if not soft_reset_sent and not is_usb_uart_bridge(port):
+        pulse_reset_signals(port)
+
+    # Some adapters drop/recreate the tty on reset, some do not.
+    if wait_s > 0:
+        wait_for_port_state(port, min(1.0, wait_s), should_exist=False)
+        if not wait_for_port_state(port, max(0.0, wait_s - 1.0), should_exist=True):
+            raise TimeoutError(f"port did not come back after reset: {port}")
+
+    time.sleep(0.2)
+    return open_serial(port)
 
 
 def main():
@@ -152,13 +226,7 @@ def main():
 
     if do_reset:
         ser.close()
-        time.sleep(0.3)
-        if wait_port_s > 0:
-            resolved_port = wait_for_port(port, wait_port_s)
-            if not resolved_port:
-                raise TimeoutError(f"port not found after reset: {port}")
-            port = resolved_port
-        ser = open_serial(port)
+        ser = reopen_after_reset(port, wait_port_s if wait_port_s > 0 else 2.0)
 
     time.sleep(0.2)
 
