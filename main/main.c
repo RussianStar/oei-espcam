@@ -1,7 +1,9 @@
-// main.c — XIAO ESP32S3 Sense (esp-idf) SNAP over USB Serial/JTAG
-// Adds "log everything to USB" while keeping JPG0/LEN/JPEG/END0 frames uncorrupted
+// main.c — SNAP capture over serial transport
+// Supports XIAO ESP32S3 Sense and ESP32-CAM (AI-Thinker pinout).
+// Adds "log everything to serial" while keeping JPG0/LEN/JPEG/END0 frames uncorrupted
 // by buffering log output during frame transmission and flushing after END0.
 
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -26,16 +28,21 @@
 #endif
 
 #include "driver/i2c_master.h"
+#include "driver/uart.h"
+#include "soc/soc_caps.h"
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
 #include "driver/usb_serial_jtag.h"
+#endif
 #include "esp_vfs_dev.h"
 
-// ----- XIAO ESP32S3 Sense pin map (Seeed table) -----
+// ----- Board camera pin maps -----
+#if CONFIG_IDF_TARGET_ESP32S3
+#define SNAP_BOARD_NAME "xiao_esp32s3_sense"
 #define PWDN_GPIO_NUM   -1
 #define RESET_GPIO_NUM  -1
 #define XCLK_GPIO_NUM   10
 #define SIOD_GPIO_NUM   40
 #define SIOC_GPIO_NUM   39
-
 #define Y9_GPIO_NUM     48
 #define Y8_GPIO_NUM     11
 #define Y7_GPIO_NUM     12
@@ -44,18 +51,54 @@
 #define Y4_GPIO_NUM     18
 #define Y3_GPIO_NUM     17
 #define Y2_GPIO_NUM     15
-
 #define VSYNC_GPIO_NUM  38
 #define HREF_GPIO_NUM   47
 #define PCLK_GPIO_NUM   13
+#define SNAP_DEFAULT_FRAME_SIZE FRAMESIZE_QXGA
+#define SNAP_CAM_I2C_PORT I2C_NUM_1
+#elif CONFIG_IDF_TARGET_ESP32
+#define SNAP_BOARD_NAME "esp32cam_aithinker"
+#define PWDN_GPIO_NUM   32
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM   0
+#define SIOD_GPIO_NUM   26
+#define SIOC_GPIO_NUM   27
+#define Y9_GPIO_NUM     35
+#define Y8_GPIO_NUM     34
+#define Y7_GPIO_NUM     39
+#define Y6_GPIO_NUM     36
+#define Y5_GPIO_NUM     21
+#define Y4_GPIO_NUM     19
+#define Y3_GPIO_NUM     18
+#define Y2_GPIO_NUM     5
+#define VSYNC_GPIO_NUM  25
+#define HREF_GPIO_NUM   23
+#define PCLK_GPIO_NUM   22
+#define SNAP_DEFAULT_FRAME_SIZE FRAMESIZE_UXGA
+#define SNAP_CAM_I2C_PORT I2C_NUM_0
+#else
+#error "Unsupported target. Add pin map + transport for this chip."
+#endif
 
 static const char *TAG = "snap_usb";
 
 static const uint8_t MAGIC[4] = {'J', 'P', 'G', '0'};
 static const uint8_t END[4]   = {'E', 'N', 'D', '0'};
 
+#if SOC_USB_SERIAL_JTAG_SUPPORTED
+#define SNAP_USE_USB_SERIAL_JTAG 1
+#else
+#define SNAP_USE_USB_SERIAL_JTAG 0
+#endif
+
+#if !SNAP_USE_USB_SERIAL_JTAG
+#ifndef SNAP_UART_NUM
+#define SNAP_UART_NUM UART_NUM_0
+#endif
+#endif
+
 #ifndef CAM_I2C_PORT
-#define CAM_I2C_PORT I2C_NUM_1
+#define CAM_I2C_PORT SNAP_CAM_I2C_PORT
 #endif
 
 #ifndef SNAP_I2C_PROBE
@@ -70,10 +113,8 @@ static const uint8_t END[4]   = {'E', 'N', 'D', '0'};
 #define SNAP_LOGS_ONLY 0
 #endif
 
-// OV3660 max QXGA, OV5640 can go higher.
-// For OV2640, set FRAMESIZE_UXGA.
 #ifndef SNAP_FRAME_SIZE
-#define SNAP_FRAME_SIZE FRAMESIZE_QXGA
+#define SNAP_FRAME_SIZE SNAP_DEFAULT_FRAME_SIZE
 #endif
 
 #ifndef SNAP_JPEG_QUALITY
@@ -84,14 +125,42 @@ static const uint8_t END[4]   = {'E', 'N', 'D', '0'};
 #define SNAP_DEINIT 0
 #endif
 
-#define USB_WRITE_CHUNK 1024
+#define SERIAL_WRITE_CHUNK 1024
 
-// -------------------- USB raw writer (never logs) --------------------
-static void usb_write_raw(const void *buf, size_t len) {
+static const char *transport_name(void) {
+#if SNAP_USE_USB_SERIAL_JTAG
+    return "usb_serial_jtag";
+#else
+    return "uart0";
+#endif
+}
+
+static void serial_transport_init(void) {
+#if SNAP_USE_USB_SERIAL_JTAG
+    usb_serial_jtag_driver_config_t cfg = {
+        .tx_buffer_size = 8192,
+        .rx_buffer_size = 8192,
+    };
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
+    esp_vfs_usb_serial_jtag_use_driver();
+#else
+    if (!uart_is_driver_installed(SNAP_UART_NUM)) {
+        ESP_ERROR_CHECK(uart_driver_install(SNAP_UART_NUM, 8192, 0, 0, NULL, 0));
+    }
+    esp_vfs_dev_uart_use_driver(SNAP_UART_NUM);
+#endif
+}
+
+// -------------------- Serial raw writer (never logs) --------------------
+static void serial_write_raw(const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     while (len > 0) {
-        size_t to_write = (len > USB_WRITE_CHUNK) ? USB_WRITE_CHUNK : len;
+        size_t to_write = (len > SERIAL_WRITE_CHUNK) ? SERIAL_WRITE_CHUNK : len;
+#if SNAP_USE_USB_SERIAL_JTAG
         int w = usb_serial_jtag_write_bytes(p, to_write, pdMS_TO_TICKS(2000));
+#else
+        int w = uart_write_bytes(SNAP_UART_NUM, (const char *)p, to_write);
+#endif
         if (w > 0) {
             p += (size_t)w;
             len -= (size_t)w;
@@ -106,6 +175,14 @@ static void usb_write_raw(const void *buf, size_t len) {
     }
 }
 
+static int serial_read_byte(uint8_t *ch, TickType_t timeout_ticks) {
+#if SNAP_USE_USB_SERIAL_JTAG
+    return usb_serial_jtag_read_bytes(ch, 1, timeout_ticks);
+#else
+    return uart_read_bytes(SNAP_UART_NUM, ch, 1, timeout_ticks);
+#endif
+}
+
 static void write_u32_le(uint32_t v) {
     uint8_t b[4] = {
         (uint8_t)(v),
@@ -113,17 +190,17 @@ static void write_u32_le(uint32_t v) {
         (uint8_t)(v >> 16),
         (uint8_t)(v >> 24),
     };
-    usb_write_raw(b, sizeof(b));
+    serial_write_raw(b, sizeof(b));
 }
 
-// -------------------- Log-to-USB with frame-safe buffering --------------------
+// -------------------- Log-to-serial with frame-safe buffering --------------------
 static volatile bool g_in_frame = false;
 
 static char g_log_buf[8192];
 static size_t g_log_len = 0;
 static portMUX_TYPE g_log_mux = portMUX_INITIALIZER_UNLOCKED;
 
-static int usb_log_vprintf(const char *fmt, va_list ap) {
+static int serial_log_vprintf(const char *fmt, va_list ap) {
     char tmp[256];
     int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
     if (n <= 0) return n;
@@ -141,7 +218,7 @@ static int usb_log_vprintf(const char *fmt, va_list ap) {
         }
         portEXIT_CRITICAL(&g_log_mux);
     } else {
-        usb_write_raw(tmp, len);
+        serial_write_raw(tmp, len);
     }
     return n;
 }
@@ -159,7 +236,7 @@ static void flush_log_buf(void) {
     portEXIT_CRITICAL(&g_log_mux);
 
     if (len) {
-        usb_write_raw(local, len);
+        serial_write_raw(local, len);
     }
 }
 
@@ -167,7 +244,7 @@ static void soft_reset_now(void) {
     g_in_frame = false;
     flush_log_buf();
     static const char msg[] = "RESETTING\n";
-    usb_write_raw(msg, sizeof(msg) - 1);
+    serial_write_raw(msg, sizeof(msg) - 1);
     vTaskDelay(pdMS_TO_TICKS(50));
     esp_restart();
 }
@@ -295,9 +372,9 @@ static void camera_deinit(void) {
 // -------------------- Framed output helpers --------------------
 static void send_empty_frame(void) {
     g_in_frame = true;
-    usb_write_raw(MAGIC, sizeof(MAGIC));
+    serial_write_raw(MAGIC, sizeof(MAGIC));
     write_u32_le(0);
-    usb_write_raw(END, sizeof(END));
+    serial_write_raw(END, sizeof(END));
     g_in_frame = false;
     flush_log_buf();
 }
@@ -325,10 +402,10 @@ static void do_snap(void) {
 
     // Binary frame: JPG0 + LEN + JPEG + END0
     g_in_frame = true;
-    usb_write_raw(MAGIC, sizeof(MAGIC));
+    serial_write_raw(MAGIC, sizeof(MAGIC));
     write_u32_le((uint32_t)fb->len);
-    usb_write_raw(fb->buf, fb->len);
-    usb_write_raw(END, sizeof(END));
+    serial_write_raw(fb->buf, fb->len);
+    serial_write_raw(END, sizeof(END));
     g_in_frame = false;
 
     esp_camera_fb_return(fb);
@@ -386,7 +463,7 @@ static void cmd_task(void *arg) {
 
     while (1) {
         uint8_t ch;
-        int r = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(20));
+        int r = serial_read_byte(&ch, pdMS_TO_TICKS(20));
         if (r > 0) {
             if (ch == '\n' || ch == '\r') {
                 line[n] = 0;
@@ -395,17 +472,17 @@ static void cmd_task(void *arg) {
                     // ignore empty lines
                 } else if (strcmp(line, "SNAP") == 0) {
                     static const char ack[] = "ACK\n";
-                    usb_write_raw(ack, sizeof(ack) - 1);
+                    serial_write_raw(ack, sizeof(ack) - 1);
                     do_snap();
                 } else if (strcmp(line, "PING") == 0) {
                     static const char ack[] = "ACK\n";
-                    usb_write_raw(ack, sizeof(ack) - 1);
+                    serial_write_raw(ack, sizeof(ack) - 1);
                     ESP_LOGI(TAG, "PING");
                 } else if (strcmp(line, "RESET") == 0 || strcmp(line, "REBOOT") == 0) {
                     soft_reset_now();
                 } else if (strcmp(line, "SLEEP") == 0) {
                     static const char ack[] = "ACK\n";
-                    usb_write_raw(ack, sizeof(ack) - 1);
+                    serial_write_raw(ack, sizeof(ack) - 1);
                     camera_deinit();
                     ESP_LOGI(TAG, "SLEEP (camera deinit only)");
                 } else {
@@ -427,22 +504,17 @@ static void cmd_task(void *arg) {
             continue;
         }
 
-        ESP_LOGW(TAG, "usb read error: %d", r);
+        ESP_LOGW(TAG, "serial read error: %d", r);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
 // -------------------- app_main --------------------
 void app_main(void) {
-    usb_serial_jtag_driver_config_t cfg = {
-        .tx_buffer_size = 8192,
-        .rx_buffer_size = 8192,
-    };
-    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&cfg));
-    esp_vfs_usb_serial_jtag_use_driver();
+    serial_transport_init();
 
-    // Route ESP_LOGx to our USB writer (frame-safe buffering).
-    esp_log_set_vprintf(usb_log_vprintf);
+    // Route ESP_LOGx to our serial writer (frame-safe buffering).
+    esp_log_set_vprintf(serial_log_vprintf);
 
     // Unbuffer stdio.
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -452,7 +524,11 @@ void app_main(void) {
     esp_log_level_set("*", ESP_LOG_VERBOSE);
 
     static const char boot_msg[] = "BOOT\n";
-    usb_write_raw(boot_msg, sizeof(boot_msg) - 1);
+    serial_write_raw(boot_msg, sizeof(boot_msg) - 1);
+    ESP_LOGI(TAG, "board=%s transport=%s", SNAP_BOARD_NAME, transport_name());
+    ESP_LOGI(TAG, "camera pins: pwdn=%d reset=%d xclk=%d sda=%d scl=%d vsync=%d href=%d pclk=%d i2c_port=%d",
+             PWDN_GPIO_NUM, RESET_GPIO_NUM, XCLK_GPIO_NUM, SIOD_GPIO_NUM, SIOC_GPIO_NUM,
+             VSYNC_GPIO_NUM, HREF_GPIO_NUM, PCLK_GPIO_NUM, (int)CAM_I2C_PORT);
     ESP_LOGI(TAG, "reset reason: %d", esp_reset_reason());
 
     printf("READY snap_usb v1\n");
