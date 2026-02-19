@@ -1,4 +1,5 @@
 import argparse
+import glob
 import os
 import struct
 import sys
@@ -94,10 +95,41 @@ def wait_for_any_token(ser, tokens, timeout_s, log_prefix=None, log_f=None):
 def wait_for_port(path, timeout_s):
     end = time.time() + timeout_s
     while time.time() < end:
-        if os.path.exists(path):
-            return True
+        if path:
+            if os.path.exists(path):
+                return path
+        else:
+            candidates = discover_serial_ports()
+            if candidates:
+                return candidates[0]
         time.sleep(0.1)
-    return False
+    return None
+
+
+def discover_serial_ports():
+    if os.name != "posix":
+        return []
+
+    candidates = []
+    for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyS*"):
+        candidates.extend(sorted(glob.glob(pattern)))
+    dedup = []
+    seen = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        dedup.append(path)
+        seen.add(path)
+    return dedup
+
+
+def resolve_port(path):
+    if path and os.path.exists(path):
+        return path
+    ports = discover_serial_ports()
+    if ports:
+        return ports[0]
+    return path
 
 
 def open_serial(port, baud, write_timeout):
@@ -123,7 +155,7 @@ def print_boot_log_until_ready(ser, timeout_s, log_f=None):
         text = line.decode("utf-8", errors="replace").rstrip("\r\n")
         print(f"[{ts}] {text}")
         sys.stdout.flush()
-        if "READY snap_usb" in text:
+        if "READY snap_usb" in text or "BOOT" in text or "Send: SNAP" in text:
             ready = True
             break
     return ready
@@ -131,7 +163,7 @@ def print_boot_log_until_ready(ser, timeout_s, log_f=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Reset, show boot log, then SNAP")
-    parser.add_argument("port", nargs="?", default="/dev/ttyACM0")
+    parser.add_argument("port", nargs="?", default=None)
     parser.add_argument("out", nargs="?", default="out.jpg")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--wait", type=float, default=0.0)
@@ -150,8 +182,18 @@ def main():
     args = parser.parse_args()
 
     if args.wait > 0:
-        if not wait_for_port(args.port, args.wait):
+        wait_port = wait_for_port(args.port, args.wait) if args.port else wait_for_port(None, args.wait)
+        if not wait_port:
+            raise TimeoutError(f"port not found: {args.port or 'auto-detect'}")
+        if not args.port and wait_port != args.port:
+            print(f"auto-selected port: {wait_port}")
+        args.port = wait_port
+    else:
+        if args.port and not os.path.exists(args.port):
             raise TimeoutError(f"port not found: {args.port}")
+        args.port = resolve_port(args.port)
+    if not args.port:
+        raise TimeoutError("no serial port found; connect device and retry")
 
     ser = None
     log_f = None
@@ -171,8 +213,10 @@ def main():
                 pass
             time.sleep(0.3)
             if args.wait > 0:
-                if not wait_for_port(args.port, args.wait):
+                wait_port = wait_for_port(None if not args.port else args.port, args.wait)
+                if not wait_port:
                     raise TimeoutError(f"port not found after reset: {args.port}")
+                args.port = wait_port
             ser = open_serial(args.port, args.baud, args.write_timeout)
 
         time.sleep(0.2)
@@ -185,7 +229,21 @@ def main():
         print("Waiting for READY...")
         ready = print_boot_log_until_ready(ser, args.ready_timeout, log_f=log_f)
         if not ready:
-            raise TimeoutError("timeout waiting for READY")
+            print("READY not seen; trying sync probe")
+            try:
+                ser.write(b"PING\n")
+                ser.flush()
+            except serial.SerialTimeoutException:
+                # try a quick reopen once if tx path is wedged
+                ser.close()
+                time.sleep(0.2)
+                ser = open_serial(args.port, args.baud, args.write_timeout)
+                ser.write(b"PING\n")
+                ser.flush()
+            if wait_for_any_token(ser, [b"ACK\n", b"ACK\r\n", b"ACK"], 2.0, log_prefix="", log_f=log_f):
+                print("ACK seen; continuing")
+            else:
+                raise TimeoutError("timeout waiting for READY")
         print("READY seen")
         if args.post_ready_delay > 0:
             time.sleep(args.post_ready_delay)

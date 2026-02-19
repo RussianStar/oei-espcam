@@ -1,4 +1,5 @@
 import os
+import glob
 import struct
 import sys
 import time
@@ -50,13 +51,46 @@ def wait_for_token(ser, token, timeout_s):
     return False
 
 
+def discover_serial_ports():
+    if os.name != "posix":
+        return []
+
+    candidates = []
+    for pattern in ("/dev/ttyACM*", "/dev/ttyUSB*", "/dev/ttyS*"):
+        candidates.extend(sorted(glob.glob(pattern)))
+    # Keep first available in deterministic priority order.
+    dedup = []
+    seen = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        dedup.append(path)
+        seen.add(path)
+    return dedup
+
+
+def resolve_port(path):
+    if path and os.path.exists(path):
+        return path
+
+    for candidate in discover_serial_ports():
+        return candidate
+
+    return path
+
+
 def wait_for_port(path, timeout_s):
     end = time.time() + timeout_s
     while time.time() < end:
-        if os.path.exists(path):
-            return True
+        if path:
+            if os.path.exists(path):
+                return path
+        else:
+            for candidate in discover_serial_ports():
+                if candidate:
+                    return candidate
         time.sleep(0.1)
-    return False
+    return None
 
 
 def open_serial(port):
@@ -71,7 +105,7 @@ def open_serial(port):
 
 def main():
     args = sys.argv[1:]
-    port = "/dev/ttyACM0"
+    port = None
     out = "out.jpg"
     sleep_after = False
     sleep_only = False
@@ -99,8 +133,19 @@ def main():
             out_set = True
 
     if wait_port_s > 0:
-        if not wait_for_port(port, wait_port_s):
+        resolved_port = wait_for_port(port if port_set else None, wait_port_s)
+        if not resolved_port:
+            target = "auto-detect" if not port_set else port
+            raise TimeoutError(f"port not found: {target}")
+        if not port_set and port != resolved_port:
+            print(f"auto-selected port: {resolved_port}")
+        port = resolved_port
+    else:
+        if port_set and port and not os.path.exists(port):
             raise TimeoutError(f"port not found: {port}")
+        port = resolve_port(port if port_set else None)
+    if not port:
+        raise TimeoutError("no serial port found; connect device and retry")
 
     ser = open_serial(port)
     # baudrate is ignored for USB CDC on many systems; keep it anyway.
@@ -109,14 +154,21 @@ def main():
         ser.close()
         time.sleep(0.3)
         if wait_port_s > 0:
-            if not wait_for_port(port, wait_port_s):
+            resolved_port = wait_for_port(port, wait_port_s)
+            if not resolved_port:
                 raise TimeoutError(f"port not found after reset: {port}")
+            port = resolved_port
         ser = open_serial(port)
 
     time.sleep(0.2)
 
     # Wait for READY banner so the device is fully booted before sending SNAP.
-    wait_for_token(ser, b"READY snap_usb", 5.0)
+    if not wait_for_token(ser, b"READY snap_usb", 5.0):
+        print("READY not seen; trying sync probe")
+        ser.write(b"PING\n")
+        ser.flush()
+        if not wait_for_token(ser, b"ACK\n", 2.0):
+            raise TimeoutError("timeout waiting for READY")
     ser.reset_input_buffer()
 
     if sleep_only:
